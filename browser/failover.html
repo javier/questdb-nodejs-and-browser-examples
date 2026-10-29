@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QuestDB Failover Test</title>
+<style>
+  body { font: 14px system-ui, sans-serif; margin: 24px; max-width: 1000px; }
+  fieldset { display: flex; gap: 12px; flex-wrap: wrap; align-items: end; border: 1px solid #ccc; margin-bottom: 12px; }
+  label { display: flex; flex-direction: column; gap: 4px; }
+  textarea { font: 13px monospace; }
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  .box { border: 1px solid #ddd; padding: 8px; }
+  .box h3 { margin: 0 0 6px; font-size: 14px; }
+  .box div { font: 13px monospace; }
+  .bad { color: #c00; font-weight: bold; }
+  svg { border: 1px solid #ddd; margin-top: 12px; }
+  #events { font: 12px monospace; height: 260px; overflow: auto; background: #f4f4f4; padding: 8px; white-space: pre; }
+</style>
+</head>
+<body>
+<h1>QuestDB failover test</h1>
+
+<fieldset>
+  <label>Hosts, one per line (first is tried first)
+    <textarea id="hosts" rows="3" cols="36">wss://host1:9000
+wss://host2:9000
+wss://host3:9000</textarea>
+  </label>
+  <label>Auth
+    <select id="authMode">
+      <option value="basic">user / password</option>
+      <option value="bearer">REST token</option>
+      <option value="none">none</option>
+    </select>
+  </label>
+  <label>User <input id="user" size="12"></label>
+  <label>Password <input id="password" type="password" size="12"></label>
+  <label>Token <input id="token" type="password" size="20"></label>
+  <label>Query target
+    <select id="target">
+      <option>any</option><option>primary</option><option>replica</option>
+    </select>
+  </label>
+  <label><span><input id="writes" type="checkbox" checked> Writes</span>
+    <input id="runId" placeholder="run id (blank: new / latest)" size="22"></label>
+  <label>Write every (ms) <input id="writeMs" type="number" value="200" min="10" size="5"></label>
+  <label>Query every (ms) <input id="queryMs" type="number" value="1000" min="100" size="5"></label>
+  <button id="start">Start</button>
+  <button id="stop" disabled>Stop</button>
+</fieldset>
+
+<p>Self-signed certificate: open each host once in this browser and accept the warning, or the WebSocket fails
+  without telling you why: <span id="certLinks"></span></p>
+
+<div class="grid">
+  <div class="box"><h3>Ingestion</h3><div id="ingress"></div></div>
+  <div class="box"><h3>Queries</h3><div id="egress"></div></div>
+  <div class="box"><h3>Verification (this run)</h3><div id="verify"></div></div>
+</div>
+
+<svg id="chart" width="1000" height="220"></svg>
+<h3>Events</h3>
+<div id="events"></div>
+
+<script type="module">
+import { connectQwpBrowserClient } from "https://cdn.jsdelivr.net/npm/@questdb/browser-client@5.0.0/dist/es/index.mjs";
+
+const TABLE = "browser_failover";
+const WINDOW_S = 120;
+const $ = (id) => document.getElementById(id);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const msg = (e) => (e?.cause ? `${e.message} (cause: ${e.cause.message ?? e.cause})` : e?.message ?? String(e));
+const time = (ms) => new Date(ms).toLocaleTimeString();
+
+let db, sender, run, writes, running = false;
+const ingress = { endpoint: "-", seq: 0, failures: 0 };
+const egress = { endpoint: "-", ok: 0, failures: 0, lastMs: 0, lastOk: 0 };
+let verify = {};
+
+const hosts = () => $("hosts").value.split(/\s+/).filter(Boolean);
+
+function renderCertLinks() {
+  $("certLinks").innerHTML = hosts()
+    .map((h) => h.replace(/^ws/, "http"))
+    .map((h) => `<a href="${h}" target="_blank">${h}</a>`).join(" ");
+}
+$("hosts").oninput = renderCertLinks;
+renderCertLinks();
+
+function logEvent(side, text) {
+  const line = `${new Date().toISOString().slice(11, 23)} [${side}] ${text}\n`;
+  const el = $("events");
+  el.textContent = (line + el.textContent).split("\n").slice(0, 300).join("\n");
+  console.info(line.trim());
+}
+
+function onConnEvent(side, e) {
+  const state = side === "ingress" ? ingress : egress;
+  if (["connected", "reconnected", "failed-over"].includes(e.kind) && e.endpoint) state.endpoint = String(e.endpoint);
+  const from = e.previousEndpoint ? ` from ${e.previousEndpoint}` : "";
+  const cause = e.cause ? ` (${msg(e.cause)})` : "";
+  logEvent(side, `${e.kind}${e.attempt ? " #" + e.attempt : ""} ${e.endpoint ?? ""}${from}${cause}`);
+}
+
+function authOption() {
+  switch ($("authMode").value) {
+    case "basic": return { type: "basic", username: $("user").value, password: $("password").value };
+    case "bearer": return { type: "bearer", token: $("token").value };
+    default: return undefined;
+  }
+}
+
+$("start").onclick = async () => {
+  const [url, ...failoverUrls] = hosts();
+  writes = $("writes").checked;
+  $("start").disabled = true;
+  try {
+    db = await connectQwpBrowserClient({
+      cluster: { url, failoverUrls, auth: authOption() },
+      // Read-only runs open no ingestion connection at all.
+      pool: { senderPoolMin: writes ? 1 : 0 },
+      ingress: {
+        onSenderError: (e) => logEvent("ingress", `rejected ${e.category} (${e.appliedPolicy}) ${e.serverMessage ?? ""}`),
+        reconnect: { onEvent: (e) => onConnEvent("ingress", e) },
+      },
+      egress: {
+        target: $("target").value,
+        initialCredit: 1024 * 1024, // lets a timeout or cancel stop a streaming query
+        queryTimeoutMs: 10_000,
+        reconnect: { onEvent: (e) => onConnEvent("egress", e) },
+      },
+    });
+    logEvent("client", "connected");
+
+    ingress.seq = 0;
+    verify = {};
+    if (writes) {
+      // Replay after a reconnect is at least once, so DEDUP keeps the table exact.
+      await exec(`CREATE TABLE IF NOT EXISTS ${TABLE} (
+        run SYMBOL, seq LONG, value DOUBLE, timestamp TIMESTAMP
+      ) TIMESTAMP(timestamp) PARTITION BY HOUR WAL DEDUP UPSERT KEYS(timestamp, run, seq)`);
+      run = $("runId").value.trim() || "run-" + Date.now();
+    } else {
+      run = $("runId").value.trim() || (await latestRun());
+    }
+    $("runId").value = run;
+
+    logEvent("client", `started ${run} (${writes ? "writes and reads" : "reads only"})`);
+    running = true;
+    $("stop").disabled = false;
+    if (writes) writeLoop();
+    queryLoop();
+    renderLoop();
+  } catch (e) {
+    logEvent("client", "start failed: " + msg(e));
+    console.error(e);
+    await db?.close().catch(() => {});
+    $("start").disabled = false;
+  }
+};
+
+$("stop").onclick = async () => {
+  running = false;
+  $("stop").disabled = true;
+  try {
+    if (sender) logEvent("ingress", `final flush acked: ${await sender.flushAndWait(10_000)}`);
+  } catch (e) {
+    logEvent("ingress", "final flush failed: " + msg(e));
+  }
+  await sender?.close().catch(() => {});
+  sender = undefined;
+  await db?.close().catch((e) => logEvent("client", "close failed: " + msg(e)));
+  logEvent("client", "stopped");
+  $("start").disabled = false;
+};
+
+// One row per tick. seq increments for every completed row, so a seq missing
+// from the table is a row that was really lost.
+async function writeLoop() {
+  while (running) {
+    try {
+      sender ??= await db.borrowSender();
+      const seq = ingress.seq++;
+      await sender.table(TABLE)
+        .symbol("run", run)
+        .intColumn("seq", seq)
+        .floatColumn("value", Math.sin(seq / 25) * 10 + Math.random())
+        .at(Date.now(), "ms");
+    } catch (e) {
+      // A terminal error ends the sender. Drop it and borrow a fresh one.
+      ingress.failures++;
+      logEvent("ingress", "sender failed: " + msg(e));
+      const dead = sender;
+      sender = undefined;
+      await dead?.close().catch(() => {});
+    }
+    await sleep(Number($("writeMs").value));
+  }
+}
+
+// A fresh lease per round: a query session that exhausts its failover limits
+// is unusable, and closing the lease makes the pool replace it.
+async function queryLoop() {
+  while (running) {
+    const started = performance.now();
+    let lease;
+    try {
+      lease = await db.borrowQuery();
+      const [[n, distinct, maxSeq, lastTs]] = await select(lease,
+        `SELECT count(), count_distinct(seq), max(seq), max(timestamp) FROM ${TABLE} WHERE run = $1`);
+      const lastMs = lastTs === null ? null : Number(lastTs / 1000n);
+      // Writing: the last WINDOW_S seconds until now. Reading only: the run's last WINDOW_S seconds.
+      const windowEnd = writes ? Date.now() : lastMs ?? Date.now();
+      const points = await select(lease,
+        `SELECT timestamp, value FROM ${TABLE} WHERE run = $1 AND timestamp > $2 ORDER BY timestamp`,
+        (b) => b.setTimestampMicros(1, BigInt(windowEnd - WINDOW_S * 1000) * 1000n));
+      const expected = maxSeq === null ? 0 : Number(maxSeq) + 1;
+      verify = {
+        rows: Number(n),
+        missing: expected - Number(distinct),
+        duplicates: Number(n) - Number(distinct),
+        lastTs: lastMs,
+        windowEnd,
+        points: points.map(([ts, v]) => [Number(ts / 1000n), v]),
+      };
+      egress.ok++;
+      egress.lastOk = Date.now();
+      egress.lastMs = Math.round(performance.now() - started);
+    } catch (e) {
+      egress.failures++;
+      logEvent("egress", "query failed: " + msg(e));
+    } finally {
+      await lease?.close().catch(() => {});
+    }
+    await sleep(Number($("queryMs").value));
+  }
+}
+
+async function exec(sql) {
+  const lease = await db.borrowQuery();
+  try {
+    const q = await lease.query(sql);
+    await q.completion;
+  } finally {
+    await lease.close();
+  }
+}
+
+// The most recent run in the table: its last row by designated timestamp.
+async function latestRun() {
+  const lease = await db.borrowQuery();
+  try {
+    const q = await lease.query(`SELECT run FROM ${TABLE} LIMIT -1`);
+    let latest;
+    for await (const batch of q) for (const [r] of batch.rows()) latest = r;
+    await q.completion;
+    if (!latest) throw new Error(`${TABLE} has no rows: run once with writes on`);
+    return latest;
+  } finally {
+    await lease.close();
+  }
+}
+
+// $1 is always the run id; moreBinds adds $2 onwards.
+async function select(lease, sql, moreBinds = (b) => b) {
+  let rows = [];
+  const q = await lease.query(sql, {
+    binds: (b) => moreBinds(b.setVarchar(0, run)),
+    onFailoverReset: () => { rows = []; }, // a failed-over query restarts from row one
+  });
+  for await (const batch of q) for (const row of batch.rows()) rows.push(row);
+  await q.completion;
+  return rows;
+}
+
+async function renderLoop() {
+  while (running) {
+    render();
+    await sleep(250);
+  }
+  render();
+}
+
+function render() {
+  const m = sender?.metrics;
+  $("ingress").innerHTML = [
+    `endpoint  ${ingress.endpoint}`,
+    `connected ${m?.connected ?? false}`,
+    `rows sent ${ingress.seq}`,
+    `published ${sender?.publishedSequence ?? "-"} (frame seq)`,
+    `acked     ${sender?.ackedSequence ?? "-"} (frame seq)`,
+    `replay    ${m?.ingress?.memoryReplayUsedBytes ?? 0} bytes`,
+    `failures  ${ingress.failures}`,
+  ].join("<br>");
+
+  const stale = egress.lastOk && Date.now() - egress.lastOk > 3 * Number($("queryMs").value);
+  $("egress").innerHTML = [
+    `endpoint  ${egress.endpoint}`,
+    `target    ${$("target").value}`,
+    `ok        ${egress.ok}`,
+    `failures  ${egress.failures}`,
+    `latency   ${egress.lastMs} ms`,
+    `<span class="${stale ? "bad" : ""}">last ok   ${egress.lastOk ? time(egress.lastOk) : "-"}</span>`,
+  ].join("<br>");
+
+  const lag = verify.lastTs ? Date.now() - verify.lastTs : null;
+  $("verify").innerHTML = [
+    `run        ${run ?? "-"}`,
+    `visible    ${verify.rows ?? "-"}${writes ? ` of ${ingress.seq} sent` : ""}`,
+    `<span class="${verify.missing > 0 ? "bad" : ""}">missing    ${verify.missing ?? "-"} (seq gaps below max)</span>`,
+    `<span class="${verify.duplicates > 0 ? "bad" : ""}">duplicates ${verify.duplicates ?? "-"}</span>`,
+    `data lag   ${!writes || lag === null ? "-" : lag + " ms"}`,
+  ].join("<br>");
+
+  renderChart(verify.points ?? [], writes ? Date.now() : verify.windowEnd ?? Date.now());
+}
+
+// Last WINDOW_S seconds. Breaks the line where rows are missing, so an outage
+// that lost data shows as a hole, and one that replayed it does not.
+function renderChart(points, now) {
+  const svg = $("chart"), w = svg.width.baseVal.value, h = svg.height.baseVal.value, pad = 30;
+  const t0 = now - WINDOW_S * 1000;
+  const gap = Math.max(1000, 5 * Number($("writeMs").value));
+  const x = (t) => pad + ((t - t0) / (now - t0)) * (w - 2 * pad);
+  const y = (v) => h - pad - ((v + 12) / 24) * (h - 2 * pad);
+  let d = "";
+  points.forEach(([t, v], i) => {
+    d += `${i === 0 || t - points[i - 1][0] > gap ? "M" : "L"}${x(t).toFixed(1)},${y(v).toFixed(1)} `;
+  });
+  svg.innerHTML = `
+    <path d="${d}" fill="none" stroke="steelblue" stroke-width="1.5"/>
+    <text x="${pad}" y="${h - 8}" font-size="11">${time(t0)}</text>
+    <text x="${w - pad}" y="${h - 8}" font-size="11" text-anchor="end">${time(now)}</text>
+    <text x="4" y="14" font-size="11">last ${WINDOW_S}s of value, gaps = missing rows</text>`;
+}
+</script>
+</body>
+</html>

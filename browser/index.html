@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QuestDB Browser Demo</title>
+<style>
+  body { font: 14px system-ui, sans-serif; margin: 24px; max-width: 900px; }
+  fieldset { display: flex; gap: 12px; flex-wrap: wrap; align-items: end; border: 1px solid #ccc; }
+  label { display: flex; flex-direction: column; gap: 4px; }
+  #log { white-space: pre-wrap; background: #f4f4f4; padding: 8px; min-height: 2em; }
+  table { border-collapse: collapse; margin-top: 12px; }
+  td, th { border: 1px solid #ddd; padding: 2px 8px; text-align: right; }
+  svg { border: 1px solid #ddd; margin-top: 12px; }
+</style>
+</head>
+<body>
+<h1>QuestDB browser client demo</h1>
+
+<fieldset>
+  <label>QuestDB URL <input id="url" value="ws://localhost:9000" size="24"></label>
+  <label>User (blank if auth is off) <input id="user"></label>
+  <label>Password <input id="password" type="password"></label>
+  <button id="run">Ingest and query</button>
+</fieldset>
+
+<p id="log"></p>
+<svg id="chart" width="860" height="240"></svg>
+<table id="table"></table>
+
+<script type="module">
+import { connectQwpBrowserClient } from "https://cdn.jsdelivr.net/npm/@questdb/browser-client@5.0.0/dist/es/index.mjs";
+
+const TABLE = "browser_demo";
+const ROWS = 60;
+const $ = (id) => document.getElementById(id);
+const log = (msg) => ($("log").textContent += msg + "\n");
+
+$("run").onclick = async () => {
+  $("log").textContent = "";
+  const user = $("user").value;
+  // Cross-origin pages cannot use cookies, so the credential travels in the
+  // WebSocket upgrade via `auth`. Omit it when QuestDB auth is off.
+  const auth = user ? { type: "basic", username: user, password: $("password").value } : undefined;
+
+  let db;
+  try {
+    db = await connectQwpBrowserClient({ cluster: { url: $("url").value, auth } });
+    log("connected");
+
+    await exec(db, `CREATE TABLE IF NOT EXISTS ${TABLE} (
+      run SYMBOL, price DOUBLE, timestamp TIMESTAMP
+    ) TIMESTAMP(timestamp) PARTITION BY DAY WAL`);
+
+    // Ingest a random walk, one row per second ending now, tagged with a run id.
+    const run = "run-" + Date.now();
+    const start = Date.now() - ROWS * 1000;
+    let price = 100;
+    const sender = await db.borrowSender();
+    try {
+      for (let i = 0; i < ROWS; i++) {
+        price += (Math.random() - 0.5) * 2;
+        await sender.table(TABLE).symbol("run", run).floatColumn("price", price).at(start + i * 1000, "ms");
+      }
+      if (!(await sender.flushAndWait(10_000))) throw new Error("no ACK within 10 s");
+    } finally {
+      await sender.close();
+    }
+    log(`ingested ${ROWS} rows for ${run}`);
+
+    // Acknowledged rows become visible shortly after, so poll until all are there.
+    let rows = [];
+    for (const deadline = Date.now() + 10_000; rows.length < ROWS; ) {
+      if (Date.now() > deadline) throw new Error(`only ${rows.length} rows visible after 10 s`);
+      await new Promise((r) => setTimeout(r, 200));
+      rows = await select(db, `SELECT timestamp, price FROM ${TABLE} WHERE run = $1 ORDER BY timestamp`, run);
+    }
+    log(`queried ${rows.length} rows`);
+
+    // TIMESTAMP comes back as bigint microseconds.
+    const points = rows.map(([ts, p]) => ({ t: new Date(Number(ts / 1000n)), p }));
+    renderTable(points);
+    renderChart(points);
+  } catch (error) {
+    log("error: " + (error?.message ?? error));
+    console.error(error);
+  } finally {
+    await db?.close();
+  }
+};
+
+async function exec(db, sql) {
+  const lease = await db.borrowQuery();
+  try {
+    const q = await lease.query(sql);
+    await q.completion;
+  } finally {
+    await lease.close();
+  }
+}
+
+async function select(db, sql, run) {
+  const lease = await db.borrowQuery();
+  try {
+    const q = await lease.query(sql, { binds: (b) => b.setVarchar(0, run) });
+    const out = [];
+    for await (const batch of q) for (const row of batch.rows()) out.push(row);
+    await q.completion;
+    return out;
+  } finally {
+    await lease.close();
+  }
+}
+
+function renderTable(points) {
+  $("table").innerHTML = "<tr><th>timestamp</th><th>price</th></tr>" +
+    points.map(({ t, p }) => `<tr><td>${t.toISOString()}</td><td>${p.toFixed(3)}</td></tr>`).join("");
+}
+
+function renderChart(points) {
+  const svg = $("chart"), w = svg.width.baseVal.value, h = svg.height.baseVal.value, pad = 40;
+  const ps = points.map((d) => d.p), min = Math.min(...ps), max = Math.max(...ps);
+  const x = (i) => pad + (i / (points.length - 1)) * (w - 2 * pad);
+  const y = (p) => h - pad - ((p - min) / (max - min || 1)) * (h - 2 * pad);
+  const line = points.map((d, i) => `${x(i)},${y(d.p)}`).join(" ");
+  const time = (d) => d.t.toLocaleTimeString();
+  svg.innerHTML = `
+    <polyline points="${line}" fill="none" stroke="steelblue" stroke-width="2"/>
+    <text x="4" y="${y(max) + 4}" font-size="11">${max.toFixed(2)}</text>
+    <text x="4" y="${y(min) + 4}" font-size="11">${min.toFixed(2)}</text>
+    <text x="${pad}" y="${h - 12}" font-size="11">${time(points[0])}</text>
+    <text x="${w - pad}" y="${h - 12}" font-size="11" text-anchor="end">${time(points.at(-1))}</text>`;
+}
+</script>
+</body>
+</html>

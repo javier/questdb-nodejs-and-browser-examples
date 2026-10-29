@@ -1,0 +1,8 @@
+node_modules/
+
+# Store-and-forward journals: queued rows, lock files with the local PID and host name
+sf/
+
+.DS_Store
+*.log
+.env

@@ -1,0 +1,8 @@
+{
+  "name": "qdb-node-failover-demo",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@questdb/nodejs-client": "5.0.0"
+  }
+}
