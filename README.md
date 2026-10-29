@@ -10,6 +10,8 @@ from the QuestDB documentation. Both failover tests write to and read from the s
 - `failover.html`: continuous writes and queries against a multi-host cluster, with
   connection events, sequence-gap and duplicate checks, and a read-only mode.
 
+![index.html: 60 rows ingested into a local QuestDB and queried back](screenshots/browser-demo.png)
+
 The pages load the client from jsDelivr, so there is no build step. Serve them on
 the origin that QuestDB allows:
 
