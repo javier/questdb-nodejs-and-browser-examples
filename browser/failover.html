@@ -74,8 +74,8 @@ const msg = (e) => (e?.cause ? `${e.message} (cause: ${e.cause.message ?? e.caus
 const time = (ms) => new Date(ms).toLocaleTimeString();
 
 let db, sender, run, writes, running = false;
-const ingress = { endpoint: "-", seq: 0, failures: 0 };
-const egress = { endpoint: "-", ok: 0, failures: 0, lastMs: 0, lastOk: 0 };
+const ingress = { endpoint: "-", link: "-", seq: 0, failures: 0 };
+const egress = { endpoint: "-", link: "-", ok: 0, failures: 0, lastMs: 0, lastOk: 0 };
 let verify = {};
 
 const hosts = () => $("hosts").value.split(/\s+/).filter(Boolean);
@@ -89,7 +89,9 @@ $("hosts").oninput = renderCertLinks;
 renderCertLinks();
 
 function logEvent(side, text) {
-  const line = `${new Date().toISOString().slice(11, 23)} [${side}] ${text}\n`;
+  const now = new Date(); // local time, like the chart axis
+  const stamp = now.toTimeString().slice(0, 8) + "." + String(now.getMilliseconds()).padStart(3, "0");
+  const line = `${stamp} [${side}] ${text}\n`;
   const el = $("events");
   el.textContent = (line + el.textContent).split("\n").slice(0, 300).join("\n");
   console.info(line.trim());
@@ -97,10 +99,18 @@ function logEvent(side, text) {
 
 function onConnEvent(side, e) {
   const state = side === "ingress" ? ingress : egress;
-  if (["connected", "reconnected", "failed-over"].includes(e.kind) && e.endpoint) state.endpoint = String(e.endpoint);
+  // The link state comes from the events: metrics.connected only says that the
+  // sender has a session, and a session stays open while it reconnects.
+  if (["connected", "reconnected", "failed-over"].includes(e.kind)) {
+    state.link = "up";
+    if (e.endpoint) state.endpoint = String(e.endpoint);
+  } else if (["disconnected", "all-endpoints-unreachable"].includes(e.kind)) {
+    state.link = "down";
+  }
   const from = e.previousEndpoint ? ` from ${e.previousEndpoint}` : "";
   const cause = e.cause ? ` (${msg(e.cause)})` : "";
-  logEvent(side, `${e.kind}${e.attempt ? " #" + e.attempt : ""} ${e.endpoint ?? ""}${from}${cause}`);
+  const head = [e.kind + (e.attempt ? " #" + e.attempt : ""), e.endpoint && String(e.endpoint)];
+  logEvent(side, head.filter(Boolean).join(" ") + from + cause);
 }
 
 function authOption() {
@@ -286,7 +296,7 @@ function render() {
   const m = sender?.metrics;
   $("ingress").innerHTML = [
     `endpoint  ${ingress.endpoint}`,
-    `connected ${m?.connected ?? false}`,
+    `<span class="${ingress.link === "down" ? "bad" : ""}">link      ${ingress.link}</span>`,
     `rows sent ${ingress.seq}`,
     `published ${sender?.publishedSequence ?? "-"} (frame seq)`,
     `acked     ${sender?.ackedSequence ?? "-"} (frame seq)`,
@@ -297,6 +307,7 @@ function render() {
   const stale = egress.lastOk && Date.now() - egress.lastOk > 3 * Number($("queryMs").value);
   $("egress").innerHTML = [
     `endpoint  ${egress.endpoint}`,
+    `<span class="${egress.link === "down" ? "bad" : ""}">link      ${egress.link}</span>`,
     `target    ${$("target").value}`,
     `ok        ${egress.ok}`,
     `failures  ${egress.failures}`,

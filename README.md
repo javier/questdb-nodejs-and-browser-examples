@@ -12,6 +12,23 @@ from the QuestDB documentation. Both failover tests write to and read from the s
 
 ![index.html: 60 rows ingested into a local QuestDB and queried back](screenshots/browser-demo.png)
 
+`failover.html` against a three-node QuestDB Enterprise cluster, with queries
+routed to a replica. While it ran, the primary was demoted with
+`SWITCH ROLE TO REPLICA`, leaving no node that accepts writes, and promoted back
+30 seconds later with `SWITCH ROLE TO PRIMARY`.
+
+During the outage, the writer's link is down, every host refuses writes, rows
+queue in memory (469 sent, 364 acknowledged), and queries keep running on the
+replica:
+
+![failover.html while no node accepts writes](screenshots/browser-failover-during.png)
+
+After the promotion, the writer reconnects and replays the queued rows with
+their original timestamps: 617 sent, 0 missing, 0 duplicates, and no gap in
+the chart:
+
+![failover.html after the primary is promoted back](screenshots/browser-failover-after.png)
+
 The pages load the client from jsDelivr, so there is no build step. Serve them on
 the origin that QuestDB allows:
 
